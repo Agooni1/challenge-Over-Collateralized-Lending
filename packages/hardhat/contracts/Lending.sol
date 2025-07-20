@@ -5,6 +5,10 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "./Corn.sol";
 import "./CornDEX.sol";
 
+interface IFlashLoanRecipient{
+    function executeOperation(uint256 amount, address initiator, address extraParam) external returns (bool);
+}
+
 error Lending__InvalidAmount();
 error Lending__TransferFailed();
 error Lending__UnsafePositionRatio();
@@ -13,6 +17,7 @@ error Lending__RepayingFailed();
 error Lending__PositionSafe();
 error Lending__NotLiquidatable();
 error Lending__InsufficientLiquidatorCorn();
+error Lending__FlashLoanFailed();
 
 contract Lending is Ownable {
     uint256 private constant COLLATERAL_RATIO = 120; // 120% collateralization required
@@ -106,8 +111,12 @@ contract Lending is Ownable {
      * @return bool True if the position is liquidatable, false otherwise
      */
     function isLiquidatable(address user) public view returns (bool) {
+        //logic given in challenge results in overflow error when value is type(uint256).max and is then *100
+        if (s_userBorrowed[user] == 0) {
+            return false;
+        }
         uint256 userpositionratio = _calculatePositionRatio(user);
-        return (userpositionratio *100) < (COLLATERAL_RATIO * 1e18);
+        return (userpositionratio * 100) < (COLLATERAL_RATIO * 1e18);
     }
 
     /**
@@ -174,7 +183,11 @@ contract Lending is Ownable {
         uint256 userBorrowed = s_userBorrowed[user];
         uint256 userCollateral = s_userCollateral[user];
 
+        // console.log("liquidate i_corn transferFrom msg.sender:");
+        // console.logAddress(msg.sender);
         i_corn.transferFrom(msg.sender, address(this), userBorrowed);
+        
+        
        
         s_userBorrowed[user] = 0;
 
@@ -195,4 +208,66 @@ contract Lending is Ownable {
         emit Liquidation(user, msg.sender, finalreward, userBorrowed, i_cornDEX.currentPrice());
 
     }
+
+    function flashLoan(IFlashLoanRecipient _recipient, uint256 _amount, address _extraParam) public {
+        // console.log("INSIDE FLASHLOAN");
+        // console.log("lending corn balance:", i_corn.balanceOf(address(this)));
+        i_corn.mintTo(address(_recipient), _amount); //pretty sure we have to make the lending contract the CORN owner to do this
+        // console.log("AFTER MINTING");
+        // console.log("CORN balance:", i_corn.balanceOf(address(_recipient)));
+        if (!_recipient.executeOperation(_amount, msg.sender, _extraParam)) {
+            revert Lending__FlashLoanFailed();
+        }
+        // console.log("AFTER EXECUTE OPERATION");
+        
+        // I really don't understand the given implementation. I guess it's trusting things to be returned?
+        // if executeOperation is set to literally just return True, this will just burn the contract's own corn balance.
+        // i_corn.burnFrom(address(this), i_corn.balanceOf(address(this)));
+
+        i_corn.transferFrom(address(_recipient), address(this), _amount);
+        i_corn.burnFrom(address(this), _amount); //I guess we still use this to not increase the total supply
+        // console.log("AFTER BURNING");
+        // console.log("Lending corn balance:", i_corn.balanceOf(address(this)));
+    }
+
+    function getMaxBorrowAmount(uint256 _ethAmount) public view returns (uint256) {
+        uint256 xReserves = address(i_cornDEX).balance;
+        uint256 yReserves = i_corn.balanceOf(address(i_cornDEX));
+        uint256 yOutput = i_cornDEX.price(_ethAmount, xReserves, yReserves);
+        uint256 maxBorrowAmount = (yOutput * 100) / COLLATERAL_RATIO;
+        return maxBorrowAmount;
+    }
+
+    function getMaxWithdrawableCollateral(address _user) public view returns (uint256) {
+        uint256 userCollateral = s_userCollateral[_user];
+        uint256 userBorrowed = s_userBorrowed[_user];
+
+        if (userBorrowed ==0 ){
+            return userCollateral;
+        }
+
+        uint256 minCollateral = (userBorrowed * 1e18 * COLLATERAL_RATIO)  / (i_cornDEX.currentPrice() * 100);
+
+        if (userCollateral <= minCollateral ){
+            return 0;
+        }
+        //slight buffer because when you try to withdraw the exact max with potential rounding it causes errors I think
+        // SRE implementation produces slightly smaller values (97% of what this produces)
+        // Pretty sure on paper both approaches are mathematically equivalent but I think due to rounding my implementaion value without slight reduction will result in withdrawal errors
+        return ((userCollateral - minCollateral) * 100 / 101); 
+        
+    }
+    // function getMaxWithdrawableCollateral(address user) public view returns (uint256) {
+    //     uint256 borrowedAmount = s_userBorrowed[user];
+    //     uint256 userCollateral = s_userCollateral[user];
+    //     if (borrowedAmount == 0) return userCollateral;
+
+    //     uint256 maxBorrowedAmount = getMaxBorrowAmount(userCollateral);
+    //     if (borrowedAmount == maxBorrowedAmount) return 0;
+
+    //     uint256 potentialBorrowingAmount = maxBorrowedAmount - borrowedAmount;
+    //     uint256 ethValueOfPotentialBorrowingAmount = (potentialBorrowingAmount * 1e18) / i_cornDEX.currentPrice();
+
+    //     return (ethValueOfPotentialBorrowingAmount * COLLATERAL_RATIO) / 100;
+    // }
 }
